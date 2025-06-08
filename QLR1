@@ -1,0 +1,305 @@
+import numpy as np
+from scipy.linalg import svd
+import quaternion  # 需要安装pyquaternion包
+
+class LOQUAT:
+    def __init__(self, num_bins=3, patch_size=8, num_similar=10, p=0.95, kappa=1e5, mu0=1e3, alpha=1.05):
+        self.num_bins = num_bins
+        self.patch_size = patch_size
+        self.num_similar = num_similar
+        self.p = p
+        self.kappa = kappa
+        self.mu0 = mu0
+        self.alpha = alpha
+        self.gamma = 1e-16
+        
+    def _quaternion_svd(self, Q):
+        """Quaternion SVD (QSVD)实现"""
+        # 将四元数矩阵转换为复伴随矩阵
+        chi = self._quaternion_to_adjoint(Q)
+        
+        # 对复伴随矩阵执行标准SVD
+        U, S, Vh = svd(chi, full_matrices=False)
+        
+        # 提取奇异值 (QSVD的奇异值是实际奇异值的两倍)######？？？？？？？？？？？？
+        sigma = S[::2] / np.sqrt(2)
+        return U, sigma, Vh
+    
+    def _quaternion_to_adjoint(self, Q):
+        """将四元数矩阵转换为复伴随矩阵"""
+        # 提取实部和虚部
+        real = quaternion.as_float_array(Q)[..., 0]
+        imag_i = quaternion.as_float_array(Q)[..., 1]
+        imag_j = quaternion.as_float_array(Q)[..., 2]
+        imag_k = quaternion.as_float_array(Q)[..., 3]
+        
+        # 构建复矩阵分量
+        Qa = real + 1j * imag_i
+        Qb = imag_j + 1j * imag_k
+        
+        # 构建复伴随矩阵
+        chi = np.block([[Qa, Qb],
+                        [-np.conj(Qb),  np.conj(Qa)]])
+        return chi
+    
+    def _awsn_regularization(self, theta, delta):
+        """调整加权Schatten-p范数正则化"""
+        # 权重设置 (基于当前奇异值)
+        omega = 1.0 / (theta + self.gamma)
+        
+        # DC编程求解
+        sigma = theta.copy()
+        for _ in range(5):  # DC迭代次数
+            grad = self.p * omega * (sigma + self.gamma)**(self.p-1)
+            sigma_new = np.maximum(theta - delta * grad, 0)
+            
+            # 检查收敛
+            if np.linalg.norm(sigma_new - sigma) < 1e-6:
+                break
+            sigma = sigma_new
+        
+        return sigma
+    
+    def _form_quaternion_group(self, image_bins):
+        """构建四元数矩阵组"""
+        height, width = image_bins[0].shape
+        quaternion_groups = []
+        
+        # 遍历所有图像块
+        for i in range(0, height - self.patch_size, 2):  # 步长为2的滑动窗口
+            for j in range(0, width - self.patch_size, 2):
+                ref_patch = [bin[i:i+self.patch_size, j:j+self.patch_size] for bin in image_bins]
+                
+                # 寻找相似块 (简化实现)
+                similar_patches = [ref_patch]  # 实际应计算块间距离
+                
+                # 构建四元数矩阵
+                Q = np.zeros((self.patch_size**2, len(similar_patches)), dtype=np.quaternion)
+                for k, patch_group in enumerate(similar_patches):
+                    for b in range(self.num_bins):
+                        flat_patch = patch_group[b].flatten()
+                        Q[:, k] += quaternion.quaternion(0, *flat_patch) if b == 0 else \
+                                  quaternion.quaternion(*[flat_patch[0] if c==b else 0 for c in range(3)])
+                
+                quaternion_groups.append(Q)
+        
+        return quaternion_groups
+    
+    def reconstruct(self, system_image, max_iter=20):
+        """LOQUAT主重建算法"""
+        # 初始化: FBP重建
+        #三维矩阵w*h*b x,z,phi
+        x = system_image
+        z = x.copy()
+        phi = np.zeros_like(x)#拉格朗日乘子
+        mu = self.mu0
+        
+        # ADMM迭代
+        for iter in range(max_iter):
+            # x子问题: 数据保真项 (使用CG求解)     
+            # a = np.dot(A, A.T) + mu * np.eye(A.shape[0]) （投影的x cg算法）
+            I = np.repeat(I, x.shape[2], axis=2)      # 形状为 (720, 720, 3)
+            a=np.ones_like(x)+mu * I #(y-Ax---->y-x)#########?????????????
+            b = z + phi / mu
+            b_cal = np.ones_like(x) @ x + mu @ b            #@ np.eye(A.shape[0])  
+            x = self.cg_solver(a, b_cal, mu)#投影、图像、CG算法
+            # x = self._solve_data_fidelity(projections, system_matrix, b, mu)
+
+            # z子问题: 正则化项
+            d = x - phi / mu
+            quaternion_groups = self._form_quaternion_group(d)
+            denoised_groups = []
+            
+            for Q in quaternion_groups:
+                # QSVD分解
+                U, theta, Vh = self._quaternion_svd(Q)
+                
+                # AWSN正则化
+                delta = self.kappa / (mu * Q.shape[0])
+                sigma = self._awsn_regularization(theta, delta)
+                
+                # 重建去噪后的四元数矩阵
+                Q_denoised = U @ np.diag(sigma) @ Vh
+                denoised_groups.append(Q_denoised)
+            
+            # 聚合去噪后的组 (简化实现)
+            z = self._aggregate_groups(denoised_groups, x.shape)
+            
+            # 更新拉格朗日乘子
+            phi += mu * (z - x)
+            
+            primal_res = np.linalg.norm(x - z)
+            dual_res = mu * np.linalg.norm(z - z_prev)
+            
+            print(f"Iter {iter+1}: Primal={primal_res:.4e}, Dual={dual_res:.4e}, Mu={mu:.1f}")
+            
+            # 检查收敛条件
+            if primal_res < tol and dual_res < tol:
+                print(f"Converged at iteration {iter+1}")
+                break
+
+            # 更新惩罚参数
+            mu *= self.alpha
+            
+            print(f"Iteration {iter+1}, mu={mu:.1f}, RMSE={np.linalg.norm(x-z):.4f}")
+        
+        return x
+    
+    # 共轭梯度求解
+    def cg_solver(y, b_k, mu_k, max_iter=10, tol=1e-6):
+        H = lambda x: (1 + mu_k) * x  # Hessian-vector乘积
+        rhs = y + mu_k * b_k          # 右侧项
+        x = np.zeros_like(y)           # 初始解
+        r = rhs - H(x)                 # 初始残差
+        p = r.copy()                   # 初始搜索方向
+        
+        for i in range(max_iter):
+            Hp = H(p)
+            alpha = np.dot(r, r) / np.dot(p, Hp)
+            x = x + alpha * p
+            r_new = r - alpha * Hp
+            
+            if np.linalg.norm(r_new) < tol:
+                break
+                
+            beta = np.dot(r_new, r_new) / np.dot(r, r)
+            p = r_new + beta * p
+            r = r_new
+        
+        return x
+
+       
+    def _aggregate_groups(self, denoised_groups, img_shape):
+        """聚合去噪后的四元数组为完整图像
+        
+        参数:
+            denoised_groups: 去噪后的四元数矩阵列表
+            img_shape: 目标图像形状 (height, width, bins)
+        
+        返回:
+            aggregated_img: 聚合后的图像 (height, width, bins)
+        """
+        height, width, bins = img_shape
+        # 初始化累加器和权重计数器
+        img_accumulator = np.zeros(img_shape, dtype=np.float32)
+        weight_counter = np.zeros(img_shape, dtype=np.float32)
+        
+        # 初始化块索引
+        patch_idx = 0
+        
+        # 遍历所有图像块位置
+        for i in range(0, height - self.patch_size, 2):  # 步长为2
+            for j in range(0, width - self.patch_size, 2):
+                if patch_idx >= len(denoised_groups):
+                    break
+                    
+                # 获取当前去噪后的四元数矩阵
+                Q_denoised = denoised_groups[patch_idx]
+                patch_idx += 1
+                
+                # 提取当前块的位置区域
+                region = (slice(i, i+self.patch_size), 
+                        slice(j, j+self.patch_size))
+                
+                # 将四元数矩阵转换为多通道图像块
+                denoised_patch = self._quaternion_to_patch(Q_denoised)
+                
+                # 累加到聚合图像
+                img_accumulator[region] += denoised_patch
+                weight_counter[region] += 1  # 更新权重
+        
+        # 处理权重为0的区域 (避免除零)
+        weight_counter[weight_counter == 0] = 1
+        
+        # 计算加权平均
+        aggregated_img = img_accumulator / weight_counter
+        
+        return aggregated_img
+
+    def _quaternion_to_patch(self, Q):
+        """将四元数矩阵转换为多通道图像块
+        
+        参数:
+            Q: 四元数矩阵 (patch_size*patch_size, num_similar)
+        
+        返回:
+            patch: 图像块 (patch_size, patch_size, num_bins)
+        """
+        # 初始化图像块
+        patch = np.zeros((self.patch_size, self.patch_size, self.num_bins), dtype=np.float32)
+        
+        # 提取四元数分量
+        quat_array = quaternion.as_float_array(Q)
+        
+        # 重构每个通道
+        for b in range(self.num_bins):
+            # 获取当前通道的分量 (虚部对应通道)
+            channel_data = quat_array[:, :, b+1]  # +1跳过实部
+            
+            # 平均所有相似块
+            channel_mean = np.mean(channel_data, axis=1)
+            
+            # 重塑为2D块
+            patch[:, :, b] = channel_mean.reshape(self.patch_size, self.patch_size)
+        
+        return patch
+
+    #     # 以下为简化实现的辅助函数(SOUL-NET)
+#     def _fbp_reconstruction(self, projections, system_matrix):
+#         """简化的FBP重建"""
+#         # 实际应使用专用CT重建库
+#         return np.random.rand(*system_matrix.shape[1:])
+    
+#     def _solve_data_fidelity(self, y, A, b, mu):
+#         """求解数据保真项 (简化实现)"""
+#         # 实际应使用
+        
+#         return b
+
+    # def conjugate_gradient(A, b, x0, tol=1e-6, max_iter=100):
+    # # """
+    # # 共轭梯度算法用于求解线性方程组 Ax = b
+    # # :param A: 系数矩阵（对称正定）
+    # # :param b: 右端项
+    # # :param x0: 初始解
+    # # :param tol: 收敛容差
+    # # :param max_iter: 最大迭代次数
+    # # :return: 近似解 x
+    # # """
+    #  x = x0.copy()
+    #  r = b - A.dot(x)  # 初始残差
+    #  p = r.copy()      # 初始搜索方向
+    #  rsold = r.dot(r)  # 残差平方范数
+
+    #  for i in range(max_iter):
+    #      Ap = A.dot(p)
+    #      alpha = rsold / p.dot(Ap)  # 步长
+    #      x += alpha * p             # 更新解
+    #      r -= alpha * Ap            # 更新残差
+    #      rsnew = r.dot(r)
+    #      if np.sqrt(rsnew) < tol:   # 检查收敛
+    #         break
+    #      beta = rsnew / rsold       # 更新搜索方向的系数
+    #      p = r + beta * p           # 更新搜索方向
+    #      rsold = rsnew
+
+    #  return x
+ 
+# # 使用示例
+# if __name__ == "__main__":
+#     # 假设数据 (实际应从真实CT数据加载)
+#     num_bins = 3
+#     projections = [np.random.rand(512, 360) for _ in range(num_bins)]
+#     system_matrix = np.random.rand(512*360, 512, 512)  # 简化系统矩阵
+    
+#     # 初始化LOQUAT，实例化
+#     reconstructor = LOQUAT(num_bins=num_bins, 
+#                           patch_size=8, 
+#                           num_similar=10,
+#                           p=0.95,
+#                           kappa=1e5,
+#                           mu0=1e3,
+#                           alpha=1.05)
+    
+#     # 执行重建
+#     reconstructed_image = reconstructor.reconstruct(projections, system_matrix, max_iter=10)
