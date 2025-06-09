@@ -1,0 +1,237 @@
+import numpy as np
+from scipy.linalg import svd
+import quaternion
+from tqdm import tqdm  # 添加进度条
+
+class LOQUAT:
+    def __init__(self, num_bins=3, patch_size=8, num_similar=10, p=0.95, kappa=1e5, mu0=1e3, alpha=1.05):
+        self.num_bins = num_bins
+        self.patch_size = patch_size
+        self.num_similar = num_similar
+        self.p = p
+        self.kappa = kappa
+        self.mu0 = mu0
+        self.alpha = alpha
+        self.gamma = 1e-16
+        self.window = self._create_cosine_window(patch_size)  # 预计算余弦窗
+        
+    def _create_cosine_window(self, size):
+        """创建余弦加权窗"""
+        window_1d = np.hanning(size)
+        return np.sqrt(np.outer(window_1d, window_1d))
+    
+    def _quaternion_svd(self, Q):
+        """Quaternion SVD (QSVD)实现 - 修正版"""
+        # 将四元数矩阵转换为复伴随矩阵
+        chi = self._quaternion_to_adjoint(Q)
+        
+        # 对复伴随矩阵执行标准SVD
+        U, S, Vh = svd(chi, full_matrices=False)
+        
+        # 修正：提取奇异值 (取前一半)
+        # 复伴随矩阵的SVD会得到2倍大小的奇异值
+        r = min(Q.shape)
+        sigma = S[:r]  # 取前r个奇异值
+        
+        return U, sigma, Vh
+    
+    def _quaternion_to_adjoint(self, Q):
+        """将四元数矩阵转换为复伴随矩阵"""
+        # 提取实部和虚部
+        quat_arr = quaternion.as_float_array(Q)
+        real = quat_arr[..., 0]
+        imag_i = quat_arr[..., 1]
+        imag_j = quat_arr[..., 2]
+        imag_k = quat_arr[..., 3]
+        
+        # 构建复矩阵分量
+        Qa = real + 1j * imag_i
+        Qb = imag_j + 1j * imag_k
+        
+        # 构建复伴随矩阵
+        chi = np.block([[Qa, Qb],
+                        [-np.conj(Qb), np.conj(Qa)]])
+        return chi
+    
+    def _awsn_regularization(self, theta, delta):
+        """调整加权Schatten-p范数正则化"""
+        # 权重设置 (基于当前奇异值)
+        omega = 1.0 / (theta + self.gamma)
+        
+        # DC编程求解
+        sigma = theta.copy()
+        for _ in range(5):  # DC迭代次数
+            grad = self.p * omega * (sigma + self.gamma)**(self.p-1)
+            sigma_new = np.maximum(theta - delta * grad, 0)
+            
+            # 检查收敛
+            if np.linalg.norm(sigma_new - sigma) < 1e-6:
+                break
+            sigma = sigma_new
+        
+        return sigma
+    
+    def _form_quaternion_group(self, image_bins):
+        """构建四元数矩阵组 - 修正为处理3D数组"""
+        height, width, _ = image_bins.shape
+        quaternion_groups = []
+        positions = []  # 存储位置信息
+        
+        # 遍历所有图像块位置
+        for i in range(0, height - self.patch_size, 2):  # 步长为2的滑动窗口
+            for j in range(0, width - self.patch_size, 2):
+                # 提取当前块 (三维块)
+                patch_group = image_bins[i:i+self.patch_size, j:j+self.patch_size, :]
+                
+                # 初始化四元数矩阵
+                Q = np.zeros((self.patch_size**2, 1), dtype=np.quaternion)
+                
+                # 将像素转换为四元数 (实部设为0)
+                for k in range(self.patch_size**2):
+                    row = k // self.patch_size
+                    col = k % self.patch_size
+                    # 获取像素值 (三个通道)
+                    values = patch_group[row, col, :]
+                    # 创建四元数 (实部为0，虚部分别对应三个通道)
+                    q = quaternion.quaternion(0, values[0], values[1], values[2])
+                    Q[k, 0] = q
+                
+                quaternion_groups.append(Q)
+                positions.append((i, j))
+        
+        return quaternion_groups, positions
+    
+    def reconstruct(self, system_image, max_iter=20, tol=1e-5):
+        """LOQUAT主重建算法 - 修正版"""
+        # 初始化: 
+        x = system_image.copy()  # (height, width, bins)
+        z = x.copy()
+        phi = np.zeros_like(x)  # 拉格朗日乘子
+        mu = self.mu0
+        
+        # 添加收敛跟踪
+        convergence = []
+        
+        # ADMM迭代
+        for iter in range(max_iter):
+            # =============== x子问题: 数据保真项 ===============
+            # 使用闭式解代替CG (更高效)
+            b = z + phi / (mu + 1e-10)  # 防止除零
+            x = (system_image + mu * b) / (1 + mu)
+            
+            # =============== z子问题: 正则化项 ===============
+            d = x - phi / (mu + 1e-10)
+            quaternion_groups, positions = self._form_quaternion_group(d)
+            denoised_groups = []
+            
+            for Q in quaternion_groups:
+                try:
+                    # QSVD分解
+                    U, theta, Vh = self._quaternion_svd(Q)
+                    
+                    # AWSN正则化
+                    delta = self.kappa / (mu * Q.shape[0])
+                    sigma = self._awsn_regularization(theta, delta)
+                    
+                    # 重建去噪后的四元数矩阵 - 修正维度问题
+                    # 创建奇异值矩阵
+                    Sigma_mat = np.zeros((U.shape[1], Vh.shape[0]))
+                    min_dim = min(len(sigma), Sigma_mat.shape[0])
+                    Sigma_mat[:min_dim, :min_dim] = np.diag(sigma[:min_dim])
+                    
+                    # 重建矩阵
+                    Q_denoised = U @ Sigma_mat @ Vh
+                    denoised_groups.append(Q_denoised)
+                except Exception as e:
+                    print(f"QSVD error: {e}, using original matrix")
+                    denoised_groups.append(Q)  # 出错时使用原始矩阵
+            
+            # 保存前一次的z用于收敛检测
+            z_prev = z.copy()
+            
+            # 聚合去噪后的组
+            z = self._aggregate_groups(denoised_groups, positions, x.shape)
+            
+            # =============== 更新拉格朗日乘子 ===============
+            phi += mu * (z - x)
+            
+            # =============== 收敛检测 ===============
+            primal_res = np.linalg.norm(x - z)
+            dual_res = mu * np.linalg.norm(z - z_prev)
+            
+            convergence.append((primal_res, dual_res))
+            
+            print(f"Iter {iter+1}: Primal={primal_res:.4e}, Dual={dual_res:.4e}, Mu={mu:.1f}")
+            
+            # 检查收敛条件
+            if primal_res < tol and dual_res < tol:
+                print(f"Converged at iteration {iter+1}")
+                break
+            
+            # 更新惩罚参数
+            mu *= self.alpha
+        
+        return x, convergence
+    
+    def _aggregate_groups(self, denoised_groups, positions, img_shape):
+        """聚合去噪后的组 - 修正版"""
+        height, width, bins = img_shape
+        img_accumulator = np.zeros(img_shape, dtype=np.float32)
+        weight_map = np.zeros(img_shape, dtype=np.float32)
+        
+        # 遍历所有去噪组
+        for idx, Q_denoised in enumerate(denoised_groups):
+            i, j = positions[idx]
+            
+            # 转换四元数矩阵为图像块
+            denoised_patch = self._quaternion_to_patch(Q_denoised)
+            
+            # 应用余弦窗加权
+            for b in range(bins):
+                weighted_patch = denoised_patch[:, :, b] * self.window
+                img_accumulator[i:i+self.patch_size, j:j+self.patch_size, b] += weighted_patch
+                weight_map[i:i+self.patch_size, j:j+self.patch_size, b] += self.window
+        
+        # 处理边缘区域
+        weight_map[weight_map == 0] = 1.0  # 避免除零
+        
+        # 归一化
+        aggregated_img = img_accumulator / weight_map
+        
+        return aggregated_img
+    def _quaternion_to_patch(self, Q_denoised):
+        """
+        将四元数矩阵转换为多通道图像块 - 修正版
+        """
+        # 提取四元数矩阵的实部和虚部
+        quat_arr = quaternion.as_float_array(Q_denoised)
+        
+        # 确保quat_arr的形状正确
+        if len(quat_arr.shape) == 3:
+            # 假设形状为 (patch_size^2, 1, 4)
+            num_pixels, _, _ = quat_arr.shape
+        elif len(quat_arr.shape) == 2:
+            # 假设形状为 (patch_size^2, 4)
+            num_pixels, _ = quat_arr.shape
+        else:
+            raise ValueError("Unexpected quaternion array shape")
+        
+        # 计算patch_size
+        patch_size = int(np.sqrt(num_pixels))
+        if patch_size * patch_size != num_pixels:
+            raise ValueError("Number of pixels is not a perfect square")
+        
+        # 初始化图像块
+        patch = np.zeros((patch_size, patch_size, self.num_bins), dtype=np.float32)
+        
+        # 提取每个通道的数据
+        for b in range(self.num_bins):
+            if b < 3:  # 假设最多有3个通道
+                # 提取对应的虚部
+                channel_data = quat_arr[..., b + 1]  # 实部是第0个分量，虚部分量从1开始
+                patch[..., b] = channel_data.reshape(patch_size, patch_size)
+            else:
+                # 如果通道数超过3，可以考虑使用其他方式处理或截断
+                pass
+        
+        return patch
