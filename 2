@@ -102,7 +102,6 @@ class LOQUAT:
         return quaternion_groups, positions
     
     def reconstruct(self, system_image, max_iter=20, tol=1e-5):
-        """LOQUAT主重建算法 - 修正版"""
         # 初始化: 
         x = system_image.copy()  # (height, width, bins)
         z = x.copy()
@@ -114,12 +113,12 @@ class LOQUAT:
         
         # ADMM迭代
         for iter in range(max_iter):
-            # =============== x子问题: 数据保真项 ===============
-            # 使用闭式解代替CG (更高效)
+            # =============== x子问题===============
+            # 使用闭式解代替CG 
             b = z + phi / (mu + 1e-10)  # 防止除零
             x = (system_image + mu * b) / (1 + mu)
             
-            # =============== z子问题: 正则化项 ===============
+            # =============== z子问题===============
             d = x - phi / (mu + 1e-10)
             quaternion_groups, positions = self._form_quaternion_group(d)
             denoised_groups = []
@@ -174,7 +173,7 @@ class LOQUAT:
         return x, convergence
     
     def _aggregate_groups(self, denoised_groups, positions, img_shape):
-        """聚合去噪后的组 - 修正版"""
+        """重构去噪后的组z """
         height, width, bins = img_shape
         img_accumulator = np.zeros(img_shape, dtype=np.float32)
         weight_map = np.zeros(img_shape, dtype=np.float32)
@@ -186,7 +185,7 @@ class LOQUAT:
             # 转换四元数矩阵为图像块
             denoised_patch = self._quaternion_to_patch(Q_denoised)
             
-            # 应用余弦窗加权
+            # 应用余弦窗加权？？？？？？？？？
             for b in range(bins):
                 weighted_patch = denoised_patch[:, :, b] * self.window
                 img_accumulator[i:i+self.patch_size, j:j+self.patch_size, b] += weighted_patch
@@ -199,10 +198,8 @@ class LOQUAT:
         aggregated_img = img_accumulator / weight_map
         
         return aggregated_img
+        
     def _quaternion_to_patch(self, Q_denoised):
-        """
-        将四元数矩阵转换为多通道图像块 - 修正版
-        """
         # 提取四元数矩阵的实部和虚部
         quat_arr = quaternion.as_float_array(Q_denoised)
         
